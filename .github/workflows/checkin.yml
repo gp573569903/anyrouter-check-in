@@ -105,6 +105,11 @@ jobs:
         PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         SERVERPUSHKEY: ${{ secrets.SERVERPUSHKEY }}
         FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+        FEISHU_DOC_URL: ${{ secrets.FEISHU_DOC_URL }}
+        FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+        FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+        FEISHU_EXPORT_FULL_KEYS: ${{ secrets.FEISHU_EXPORT_FULL_KEYS }}
+        FEISHU_DOC_PARENT_BLOCK_ID: ${{ secrets.FEISHU_DOC_PARENT_BLOCK_ID }}
         WEIXIN_WEBHOOK: ${{ secrets.WEIXIN_WEBHOOK }}
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
