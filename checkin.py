@@ -19,6 +19,7 @@ import httpx
 from cloakbrowser import launch_async
 from dotenv import load_dotenv
 
+from utils.api_tokens import fetch_api_tokens_with_client
 from utils.browser import (
 	BrowserLoginResult,
 	has_session_cookie,
@@ -35,6 +36,7 @@ from utils.browser import (
 )
 from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.debug import debug_print, is_debug_enabled
+from utils.feishu_doc import update_feishu_doc
 from utils.notify import notify
 from utils.proxy import get_playwright_proxy, get_proxy_server
 
@@ -358,7 +360,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	provider_config = app_config.get_provider(account.provider)
 	if not provider_config:
 		print(f'[FAILED] {account_name}: Provider "{account.provider}" not found in configuration')
-		return False, None, None
+		return False, None, None, None, None
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
@@ -382,17 +384,17 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			auth_method = 'email/password'
 		else:
 			print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
-			return False, None, None
+			return False, None, None, None, None
 	else:
 		user_cookies = parse_cookies(account.cookies)
 		if not user_cookies:
 			print(f'[FAILED] {account_name}: Invalid configuration format')
-			return False, None, None
+			return False, None, None, None, None
 		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 		auth_method = 'session cookies'
 
 	if not all_cookies:
-		return False, None, None
+		return False, None, None, None, None
 
 	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
 
@@ -414,7 +416,7 @@ def run_check_in_requests(
 	*,
 	api_user_override: str | None = None,
 	use_proxy: bool = False,
-) -> tuple[bool, dict | None, dict | None]:
+) -> tuple[bool, dict | None, dict | None, list | None, str | None]:
 	"""执行 HTTP 签到请求（同步，避免在 async 上下文中使用阻塞 httpx）。"""
 	try:
 		client_kwargs: dict = {'http2': True, 'timeout': 30.0}
@@ -458,19 +460,43 @@ def run_check_in_requests(
 			if provider_config.needs_manual_check_in():
 				success = execute_check_in(client, account_name, provider_config, headers)
 				user_info_after = get_user_info(client, headers, user_info_url)
-				return success, user_info_before, user_info_after
+				api_tokens, api_token_error = get_api_token_snapshot(
+					client,
+					account_name,
+					provider_config,
+					headers,
+				)
+				return success, user_info_before, user_info_after, api_tokens, api_token_error
 
 			user_info_after = get_user_info(client, headers, user_info_url)
 			if user_info_after and user_info_after.get('success'):
 				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
-				return True, user_info_before, user_info_after
+				api_tokens, api_token_error = get_api_token_snapshot(
+					client,
+					account_name,
+					provider_config,
+					headers,
+				)
+				return True, user_info_before, user_info_after, api_tokens, api_token_error
 			error = user_info_after.get('error', 'Unknown error') if user_info_after else 'Unknown error'
 			print(f'[FAILED] {account_name}: Auto check-in failed - {error}')
-			return False, user_info_before, user_info_after
+			return False, user_info_before, user_info_after, None, None
 
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Error occurred during check-in process - {str(e)[:50]}...')
-		return False, None, None
+		return False, None, None, None, None
+
+
+def get_api_token_snapshot(client, account_name: str, provider_config, headers: dict) -> tuple[list | None, str | None]:
+	"""Load API token list for external status exports."""
+	try:
+		tokens, endpoint = fetch_api_tokens_with_client(client, account_name, provider_config, headers)
+		print(f'[INFO] {account_name}: Loaded {len(tokens)} API token(s) from {endpoint}')
+		return tokens, None
+	except Exception as e:
+		error = str(e)[:120]
+		print(f'[WARN] {account_name}: Failed to load API token list - {error}')
+		return None, error
 
 
 async def main():
@@ -510,27 +536,42 @@ async def main():
 	notification_content = []
 	current_balances = {}
 	account_check_in_details = {}
+	feishu_account_snapshots = []
 	need_notify = False
 	balance_changed = False
 
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
 		try:
-			success, user_info_before, user_info_after = await check_in_account(account, i, app_config)
+			success, user_info_before, user_info_after, api_tokens, api_token_error = await check_in_account(
+				account,
+				i,
+				app_config,
+			)
 			if success:
 				success_count += 1
 
 			should_notify_this_account = False
+			account_name = account.get_display_name(i)
+			feishu_account_name = account.email or account_name
+			feishu_snapshot = {
+				'name': feishu_account_name,
+				'provider': account.provider,
+				'success': success,
+				'tokens': api_tokens or [],
+				'token_error': api_token_error,
+			}
 
 			if not success:
 				should_notify_this_account = True
 				need_notify = True
-				account_name = account.get_display_name(i)
 				print(f'[NOTIFY] {account_name} failed, will send notification')
 
 			if user_info_after and user_info_after.get('success'):
 				current_quota = user_info_after['quota']
 				current_used = user_info_after['used_quota']
+				feishu_snapshot['quota'] = current_quota
+				feishu_snapshot['used_quota'] = current_used
 				current_balances[account_key] = {'quota': current_quota, 'used': current_used}
 
 				if user_info_before and user_info_before.get('success'):
@@ -558,8 +599,9 @@ async def main():
 						'success': success,
 					}
 
+			feishu_account_snapshots.append(feishu_snapshot)
+
 			if should_notify_this_account:
-				account_name = account.get_display_name(i)
 				status = '[SUCCESS]' if success else '[FAIL]'
 				account_result = f'{status} {account_name}'
 				if user_info_after and user_info_after.get('success'):
@@ -571,6 +613,15 @@ async def main():
 		except Exception as e:
 			account_name = account.get_display_name(i)
 			print(f'[FAILED] {account_name} processing exception: {e}')
+			feishu_account_snapshots.append(
+				{
+					'name': account_name,
+					'provider': account.provider,
+					'success': False,
+					'tokens': [],
+					'error': str(e)[:120],
+				}
+			)
 			need_notify = True
 			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
 
@@ -599,6 +650,12 @@ async def main():
 
 	if current_balance_hash:
 		save_balance_hash(current_balance_hash)
+
+	if feishu_account_snapshots:
+		try:
+			update_feishu_doc(feishu_account_snapshots)
+		except Exception as e:
+			print(f'[FEISHU_DOC] Update failed: {str(e)[:160]}')
 
 	if need_notify and notification_content:
 		summary = [

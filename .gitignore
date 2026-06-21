@@ -11,5 +11,6 @@ htmlcov
 balance_hash.txt
 .browser_profiles
 checkin_screenshots
+api_tokens.local.json
 
 .DS_Store
