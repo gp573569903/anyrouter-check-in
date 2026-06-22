@@ -89,6 +89,20 @@ def parse_cookies(cookies_data):
 	return {}
 
 
+def get_checkin_concurrency(total_accounts: int) -> int:
+	"""Resolve bounded account concurrency from CHECKIN_CONCURRENCY."""
+	raw = (os.getenv('CHECKIN_CONCURRENCY') or '3').strip()
+	try:
+		concurrency = int(raw)
+	except ValueError:
+		print(f'[WARN] Invalid CHECKIN_CONCURRENCY={raw!r}, using 3')
+		concurrency = 3
+	if concurrency < 1:
+		print('[WARN] CHECKIN_CONCURRENCY must be >= 1, using 1')
+		concurrency = 1
+	return min(concurrency, max(total_accounts, 1))
+
+
 async def get_waf_cookies_with_browser(
 	account_name: str,
 	login_url: str,
@@ -247,10 +261,14 @@ def get_user_info(client, headers, user_info_url: str):
 				user_data = data.get('data', {})
 				quota = round(user_data.get('quota', 0) / 500000, 2)
 				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+				aff_quota_raw = user_data.get('aff_quota', 0) or 0
+				aff_quota = round(aff_quota_raw / 500000, 2) if isinstance(aff_quota_raw, int | float) else 0
 				return {
 					'success': True,
 					'quota': quota,
 					'used_quota': used_quota,
+					'aff_quota': aff_quota,
+					'aff_quota_raw': aff_quota_raw,
 					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
 				}
 		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
@@ -315,6 +333,56 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 	else:
 		print(f'[FAILED] {account_name}: Check-in failed - HTTP {response.status_code}')
 		return False
+
+
+def transfer_aff_quota_to_balance(client, account_name: str, provider_config, headers: dict, user_info: dict | None):
+	"""Transfer invitation reward quota to account balance when available."""
+	if not user_info or not user_info.get('success'):
+		return False
+
+	aff_quota_raw = user_info.get('aff_quota_raw', 0) or 0
+	if not isinstance(aff_quota_raw, int | float) or aff_quota_raw <= 0:
+		return False
+
+	aff_quota = round(aff_quota_raw / 500000, 2)
+	print(f'[NETWORK] {account_name}: Transferring invitation reward ${aff_quota:.2f} to balance')
+
+	transfer_headers = headers.copy()
+	transfer_headers.update({'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'})
+	transfer_url = f'{provider_config.domain}/api/user/aff_transfer'
+	try:
+		response = client.post(transfer_url, headers=transfer_headers, json={'quota': aff_quota_raw}, timeout=30)
+		print(f'[RESPONSE] {account_name}: Invitation reward transfer status code {response.status_code}')
+		if response.status_code != 200:
+			print(f'[WARN] {account_name}: Invitation reward transfer failed - HTTP {response.status_code}')
+			return False
+
+		result = response.json()
+		if result.get('success'):
+			message = result.get('message') or 'success'
+			print(f'[SUCCESS] {account_name}: Invitation reward transferred - {message}')
+			return True
+
+		error_msg = result.get('message') or result.get('msg') or 'Unknown error'
+		print(f'[WARN] {account_name}: Invitation reward transfer failed - {error_msg}')
+		return False
+	except Exception as e:
+		print(f'[WARN] {account_name}: Invitation reward transfer error - {str(e)[:80]}')
+		return False
+
+
+def refresh_user_info_after_reward_transfer(client, account_name: str, provider_config, headers: dict, user_info: dict | None):
+	"""Transfer invitation rewards first, then return fresh user info for balance reporting."""
+	if transfer_aff_quota_to_balance(client, account_name, provider_config, headers, user_info):
+		user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
+		refreshed = get_user_info(client, headers, user_info_url)
+		if refreshed and refreshed.get('success'):
+			print(f'[INFO] {account_name}: Balance refreshed after invitation reward transfer')
+			print(refreshed['display'])
+			return refreshed
+		if refreshed:
+			print(f'[WARN] {account_name}: Failed to refresh balance after invitation reward transfer - {refreshed.get("error")}')
+	return user_info
 
 
 def format_check_in_notification(detail: dict) -> str:
@@ -398,7 +466,8 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
 	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
 
-	return run_check_in_requests(
+	return await asyncio.to_thread(
+		run_check_in_requests,
 		all_cookies,
 		account,
 		account_name,
@@ -460,6 +529,13 @@ def run_check_in_requests(
 			if provider_config.needs_manual_check_in():
 				success = execute_check_in(client, account_name, provider_config, headers)
 				user_info_after = get_user_info(client, headers, user_info_url)
+				user_info_after = refresh_user_info_after_reward_transfer(
+					client,
+					account_name,
+					provider_config,
+					headers,
+					user_info_after,
+				)
 				api_tokens, api_token_error = get_api_token_snapshot(
 					client,
 					account_name,
@@ -471,6 +547,13 @@ def run_check_in_requests(
 			user_info_after = get_user_info(client, headers, user_info_url)
 			if user_info_after and user_info_after.get('success'):
 				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
+				user_info_after = refresh_user_info_after_reward_transfer(
+					client,
+					account_name,
+					provider_config,
+					headers,
+					user_info_after,
+				)
 				api_tokens, api_token_error = get_api_token_snapshot(
 					client,
 					account_name,
@@ -540,14 +623,29 @@ async def main():
 	need_notify = False
 	balance_changed = False
 
-	for i, account in enumerate(accounts):
+	concurrency = get_checkin_concurrency(len(accounts))
+	print(f'[INFO] Account concurrency: {concurrency}')
+	semaphore = asyncio.Semaphore(concurrency)
+
+	async def run_account_with_limit(account_index: int, account: AccountConfig):
+		async with semaphore:
+			try:
+				result = await check_in_account(account, account_index, app_config)
+				return account_index, account, result, None
+			except Exception as e:
+				return account_index, account, None, e
+
+	account_results = await asyncio.gather(
+		*(run_account_with_limit(i, account) for i, account in enumerate(accounts))
+	)
+
+	for i, account, result, exception in sorted(account_results, key=lambda item: item[0]):
 		account_key = f'account_{i + 1}'
 		try:
-			success, user_info_before, user_info_after, api_tokens, api_token_error = await check_in_account(
-				account,
-				i,
-				app_config,
-			)
+			if exception is not None:
+				raise exception
+			assert result is not None
+			success, user_info_before, user_info_after, api_tokens, api_token_error = result
 			if success:
 				success_count += 1
 

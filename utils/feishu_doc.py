@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote, urlparse
 
@@ -14,9 +14,18 @@ import httpx
 from utils.api_tokens import mask_secret
 
 FEISHU_API_BASE = 'https://open.feishu.cn/open-apis'
+UTC_PLUS_8 = timezone(timedelta(hours=8))
 OVERVIEW_SHEET_TITLE = '账号总览'
 TOKEN_SHEET_TITLE = 'API令牌明细'
 RUN_LOG_SHEET_TITLE = '运行记录'
+
+
+def _now_utc8() -> datetime:
+	return datetime.now(UTC_PLUS_8)
+
+
+def _format_datetime_utc8(value: datetime) -> str:
+	return value.astimezone(UTC_PLUS_8).strftime('%Y-%m-%d %H:%M:%S')
 
 
 @dataclass(frozen=True)
@@ -113,7 +122,7 @@ def _format_time(timestamp: Any) -> str:
 	if not isinstance(timestamp, int) or timestamp <= 0:
 		return 'never'
 	try:
-		return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+		return datetime.fromtimestamp(timestamp, tz=UTC_PLUS_8).strftime('%Y-%m-%d %H:%M:%S')
 	except Exception:
 		return str(timestamp)
 
@@ -128,7 +137,7 @@ def _format_token_key(token: dict[str, Any], export_full_keys: bool) -> str:
 def build_snapshot_lines(accounts: list[dict[str, Any]], *, export_full_keys: bool) -> list[str]:
 	lines = [
 		'AnyRouter Check-in Snapshot',
-		f'Updated at: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
+		f'Updated at: {_format_datetime_utc8(_now_utc8())}',
 		'',
 	]
 	for account in accounts:
@@ -164,7 +173,7 @@ def build_snapshot_lines(accounts: list[dict[str, Any]], *, export_full_keys: bo
 def build_snapshot_rows(accounts: list[dict[str, Any]], *, export_full_keys: bool) -> list[list[Any]]:
 	rows: list[list[Any]] = [
 		['AnyRouter Check-in Snapshot'],
-		['Updated at', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
+		['Updated at', _format_datetime_utc8(_now_utc8())],
 		[],
 		[
 			'Account',
@@ -212,7 +221,7 @@ def build_snapshot_rows(accounts: list[dict[str, Any]], *, export_full_keys: boo
 
 
 def build_account_overview_rows(accounts: list[dict[str, Any]]) -> list[list[Any]]:
-	now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+	now = _format_datetime_utc8(_now_utc8())
 	rows: list[list[Any]] = [
 		[
 			'账号名',
@@ -341,7 +350,7 @@ def build_run_log_row(accounts: list[dict[str, Any]]) -> list[Any]:
 	success_count = sum(1 for account in accounts if account.get('success'))
 	total_count = len(accounts)
 	return [
-		datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+		_format_datetime_utc8(_now_utc8()),
 		total_count,
 		success_count,
 		total_count - success_count,
